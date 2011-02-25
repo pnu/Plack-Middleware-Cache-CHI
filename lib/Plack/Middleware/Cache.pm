@@ -47,7 +47,7 @@ sub _handle_cache {
         return $self->app->($env);
     }
 
-    my $compute = sub { warn 'going to app'; $self->app->($env) };
+    my $compute = sub { $self->app->($env) };
 
     return $self->chi->compute( $cachekey, $compute, $opts );
 }
