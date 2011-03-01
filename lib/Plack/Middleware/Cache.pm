@@ -7,6 +7,7 @@ use Plack::Util::Accessor qw( chi rules scrub cachequeries trace );
 use Data::Dumper;
 use Plack::Request;
 use Plack::Response;
+use Time::HiRes qw( gettimeofday tv_interval );
 
 our @trace;
 
@@ -19,6 +20,7 @@ sub call {
 
     ## Localize trace for this request
     local @trace = ();
+    my $t0 = [gettimeofday];
 
     my $req = Plack::Request->new($env);
     my $r = $self->handle($req);
@@ -30,7 +32,8 @@ sub call {
 
     $res->headers->push_header(
         'X-Plack-Cache' => $trace,
-        'X-Plack-Cache-Key' => $key
+        'X-Plack-Cache-Key' => $key,
+        'X-Plack-Cache-Time' => tv_interval($t0),
     );
 
     $res->finalize;
