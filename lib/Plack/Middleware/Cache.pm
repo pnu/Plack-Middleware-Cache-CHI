@@ -25,15 +25,18 @@ sub call {
     my $req = Plack::Request->new($env);
     my $r = $self->handle($req);
     my $res = Plack::Response->new(@$r);
+    my $t1 = [gettimeofday];
 
     ## Add trace and cache key to response headers
     my $trace = join q{, }, @trace;
     my $key = $self->cachekey($req);
+    my $us = ($t1->[0] - $t0->[0]) * 1_000_000;
+    $us += $t1->[1] - $t0->[1];
 
     $res->headers->push_header(
         'X-Plack-Cache' => $trace,
         'X-Plack-Cache-Key' => $key,
-        'X-Plack-Cache-Time' => tv_interval($t0),
+        'X-Plack-Cache-Time' => "$us us",
     );
 
     $res->finalize;
