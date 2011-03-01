@@ -7,9 +7,16 @@ use Plack::Util::Accessor qw( chi rules scrub cachequeries trace );
 use Data::Dumper;
 use Plack::Request;
 use Plack::Response;
-use Time::HiRes qw( gettimeofday tv_interval );
+use Time::HiRes qw( gettimeofday );
 
 our @trace;
+our $timer_call;
+our $timer_pass;
+
+sub _uinterval {
+    my ( $t0, $t1 ) = ( @_, [gettimeofday] );
+    ($t1->[0] - $t0->[0]) * 1_000_000 + $t1->[1] - $t0->[1];
+}
 
 sub call {
     my ($self,$env) = @_;
@@ -20,23 +27,30 @@ sub call {
 
     ## Localize trace for this request
     local @trace = ();
-    my $t0 = [gettimeofday];
+    local $timer_pass = undef;
+    local $timer_call = [gettimeofday];
 
     my $req = Plack::Request->new($env);
     my $r = $self->handle($req);
     my $res = Plack::Response->new(@$r);
-    my $t1 = [gettimeofday];
 
     ## Add trace and cache key to response headers
+    $timer_call = _uinterval($timer_call);
     my $trace = join q{, }, @trace;
     my $key = $self->cachekey($req);
-    my $us = ($t1->[0] - $t0->[0]) * 1_000_000;
-    $us += $t1->[1] - $t0->[1];
+
+    ## The subrequest is timed separately
+    if ( $timer_pass ) {
+        $timer_call -= $timer_pass;
+        $res->headers->push_header(
+            'X-Plack-Cache-Time-Pass' => "$timer_pass us",
+        );
+    }
 
     $res->headers->push_header(
         'X-Plack-Cache' => $trace,
         'X-Plack-Cache-Key' => $key,
-        'X-Plack-Cache-Time' => "$us us",
+        'X-Plack-Cache-Time' => "$timer_call us",
     );
 
     $res->finalize;
@@ -60,7 +74,12 @@ sub handle {
 sub pass {
     my ($self,$req) = @_;
     push @trace, 'pass';
-    $self->app->($req->env);
+    $timer_pass = [gettimeofday];
+
+    my $res = $self->app->($req->env);
+
+    $timer_pass = _uinterval($timer_pass);
+    return $res;
 }
 
 sub invalidate {
@@ -165,7 +184,7 @@ sub delegate {
     my ($self, $req, $opts) = @_;
     push @trace, 'delegate';
 
-    my $res = $self->app->($req->env);
+    my $res = $self->pass($req);
     foreach ( @{ $self->scrub || [] } ) {
         Plack::Util::header_remove( $res->[1], $_ );
     }
