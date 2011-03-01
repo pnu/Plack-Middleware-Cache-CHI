@@ -3,28 +3,69 @@ use strict;
 use warnings;
 use parent qw/Plack::Middleware/;
 
-use Plack::Util::Accessor qw( chi rules scrub cachequeries );
+use Plack::Util::Accessor qw( chi rules scrub cachequeries trace );
 use Data::Dumper;
+use Plack::Request;
+use Plack::Response;
+
+our @trace;
 
 sub call {
-    my $self = shift;
-    my $env  = shift;
+    my ($self,$env) = @_;
 
+    ## Pass-thru streaming responses
     return $self->app->($env)
-        if ( ref $env eq 'CODE' or
-        $env->{REQUEST_METHOD} ne 'GET' );
+        if ( ref $env eq 'CODE' );
 
-    my $res = $self->_handle_cache($env);
+    ## Localize trace for this request
+    local @trace = ();
 
-    if ( $res and $res->[0] >= 200 and $res->[0] < 500 ) {
-        return $res;
-    }
+    my $req = Plack::Request->new($env);
+    my $r = $self->handle($req);
+    my $res = Plack::Response->new(@$r);
 
-    return $self->app->($env);
+    ## Add trace and cache key to response headers
+    my $trace = join q{, }, @trace;
+    my $key = $self->cachekey($req);
+
+    $res->headers->push_header(
+        'X-Plack-Cache' => $trace,
+        'X-Plack-Cache-Key' => $key
+    );
+
+    $res->finalize;
 }
 
-sub _handle_cache {
-    my($self, $env) = @_;
+sub handle {
+    my ($self,$req) = @_;
+
+    if ( $req->method eq 'GET' or $req->method eq 'HEAD' ) {
+        if ( $req->headers->header('Expect') ) {
+            push @trace, 'expect';
+            $self->pass($req);
+        } else {
+            $self->lookup($req);
+        }
+    } else {
+        $self->invalidate($req);
+    }
+}
+
+sub pass {
+    my ($self,$req) = @_;
+    push @trace, 'pass';
+    $self->app->($req->env);
+}
+
+sub invalidate {
+    my ($self,$req) = @_;
+    push @trace, 'invalidate';
+    $self->chi->remove( $self->cachekey($req) );
+    $self->pass($req);
+}
+
+sub match {
+    my ($self, $req) = @_;
 
     my $path;
     my $opts;
@@ -33,44 +74,102 @@ sub _handle_cache {
     while ( @rules || return ) {
         my $match = shift @rules;
         $opts = shift @rules;
-        $path = $env->{PATH_INFO};
+        $path = $req->path_info;
         last if 'CODE' eq ref $match ? $match->($path) : $path =~ $match;
     }
-    return if not defined $opts;
-
-    my $cachekey = 
-        $env->{REQUEST_METHOD}.' '.$env->{PATH_INFO}.' '.
-        ($self->cachequeries ? $env->{QUERY_STRING}.' ' : '').
-        $env->{SERVER_PROTOCOL}.' '.$env->{HTTP_HOST};
-
-    local $env->{PATH_INFO} = $path; # rewrite PATH
-
-    if ( length $env->{QUERY_STRING} and not $self->cachequeries ) {
-        $self->chi->remove( $cachekey );
-        return $self->app->($env);
-    }
-
-    my $compute = sub {
-        my $res = $self->app->($env);
-        $self->_scrub_headers( $res );
-
-        my $body;
-        Plack::Util::foreach( $res->[2], sub {
-            $body .= $_[0] if $_[0];
-        });
-
-        return [ $res->[0], $res->[1], [$body] ];
-    };
-
-    return $self->chi->compute( $cachekey, $compute, $opts );
+    return $opts;
 }
 
-sub _scrub_headers {
-    my($self, $res) = @_;
+sub lookup {
+    my ($self, $req) = @_;
+    push @trace, 'lookup';
 
+    my $opts = $self->match($req);
+    
+    return $self->pass($req)
+        if not defined $opts;
+
+    return $self->invalidate($req)
+        if ( $req->param and not $self->cachequeries );
+
+    my $entry = $self->fetch( $req );
+    my $res = [ 500, ['Content-Type','text/plain'], ['ISE'] ];
+
+    if ( defined $entry ) {
+        push @trace, 'hit';
+        $res = $entry->[1];
+        return $self->invalidate($req)
+            if not $self->valid($req,$res);
+    } else {
+        push @trace, 'miss';
+        $res = $self->delegate($req);
+        $self->store($req,$res,$opts)
+            if $self->valid($req,$res);
+    }
+    return $res;
+}
+
+sub valid {
+    my ($self, $req, $res) = @_;
+
+    my $res_status = $res->[0];
+
+    return
+        unless (
+            $res_status == 200 or
+            $res_status == 203 or
+            $res_status == 300 or
+            $res_status == 301 or
+            $res_status == 302 or
+            $res_status == 404 or
+            $res_status == 410
+        );
+    
+    return 1;
+}
+
+sub cachekey {
+    my ($self, $req) = @_;
+
+    my $uri = $req->uri->canonical;
+
+    $uri->query(undef)
+        if not $self->cachequeries;
+
+    $uri->as_string;
+}
+
+sub fetch {
+    my ($self, $req) = @_;
+    push @trace, 'fetch';
+    
+    my $key = $self->cachekey($req);
+    $self->chi->get( $key );
+}
+
+sub store {
+    my ($self, $req, $res, $opts) = @_;
+    push @trace, 'store';
+    
+    my $key = $self->cachekey($req);
+    $self->chi->set( $key, [$req->headers,$res], $opts );
+}
+
+sub delegate {
+    my ($self, $req, $opts) = @_;
+    push @trace, 'delegate';
+
+    my $res = $self->app->($req->env);
     foreach ( @{ $self->scrub || [] } ) {
         Plack::Util::header_remove( $res->[1], $_ );
     }
+
+    my $body;
+    Plack::Util::foreach( $res->[2], sub {
+        $body .= $_[0] if $_[0];
+    });
+
+    return [ $res->[0], $res->[1], [$body] ];
 }
 
 1;
