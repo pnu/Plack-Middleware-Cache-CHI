@@ -3,7 +3,7 @@ use strict;
 use warnings;
 use parent qw/Plack::Middleware/;
 
-use Plack::Util::Accessor qw( chi rules scrub );
+use Plack::Util::Accessor qw( chi rules scrub cachequeries );
 use Data::Dumper;
 
 sub call {
@@ -40,11 +40,12 @@ sub _handle_cache {
 
     my $cachekey = 
         $env->{REQUEST_METHOD}.' '.$env->{PATH_INFO}.' '.
+        ($self->cachequeries ? $env->{QUERY_STRING}.' ' : '').
         $env->{SERVER_PROTOCOL}.' '.$env->{HTTP_HOST};
-    
+
     local $env->{PATH_INFO} = $path; # rewrite PATH
 
-    if ( length $env->{QUERY_STRING} ) {
+    if ( length $env->{QUERY_STRING} and not $self->cachequeries ) {
         $self->chi->remove( $cachekey );
         return $self->app->($env);
     }
