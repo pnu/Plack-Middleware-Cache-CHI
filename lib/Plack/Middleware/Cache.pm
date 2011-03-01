@@ -16,9 +16,9 @@ sub call {
 
     my $res = $self->_handle_cache($env);
 
-    return $res
-        if ( $res and $res->[0] >= 200
-        and $res->[0] < 300 );
+    if ( $res and $res->[0] >= 200 and $res->[0] < 500 ) {
+        return $res;
+    }
 
     return $self->app->($env);
 }
