@@ -3,7 +3,7 @@ use strict;
 use warnings;
 use parent qw/Plack::Middleware/;
 
-use Plack::Util::Accessor qw( chi rules scrub cachequeries trace );
+use Plack::Util::Accessor qw( storage rules scrub );
 use Data::Dumper;
 use Plack::Request;
 use Plack::Response;
@@ -85,7 +85,7 @@ sub pass {
 sub invalidate {
     my ($self,$req) = @_;
     push @trace, 'invalidate';
-    $self->chi->remove( $self->cachekey($req) );
+    $self->storage->remove( $self->cachekey($req) );
     $self->pass($req);
 }
 
@@ -93,26 +93,28 @@ sub match {
     my ($self, $req) = @_;
 
     my $path;
-    my $opts;
+    my $ttl;
 
     my @rules = @{ $self->rules || [] };
     while ( @rules || return ) {
         my $match = shift @rules;
-        $opts = shift @rules;
+        $ttl = shift @rules;
         $path = $req->path_info;
         last if 'CODE' eq ref $match ? $match->($path) : $path =~ $match;
     }
-    return $opts;
+    $req->env->{PATH_INFO} = $path;
+
+    return $ttl;
 }
 
 sub lookup {
     my ($self, $req) = @_;
     push @trace, 'lookup';
 
-    my $opts = $self->match($req);
-    
+    my $ttl = $self->match($req);
+
     return $self->pass($req)
-        if not defined $opts;
+        if not defined $ttl;
 
     return $self->invalidate($req)
         if ( $req->param and not $self->cachequeries );
@@ -128,7 +130,7 @@ sub lookup {
     } else {
         push @trace, 'miss';
         $res = $self->delegate($req);
-        $self->store($req,$res,$opts)
+        $self->store($req,$res,$ttl)
             if $self->valid($req,$res);
     }
     return $res;
@@ -169,19 +171,19 @@ sub fetch {
     push @trace, 'fetch';
     
     my $key = $self->cachekey($req);
-    $self->chi->get( $key );
+    $self->storage->get( $key );
 }
 
 sub store {
-    my ($self, $req, $res, $opts) = @_;
+    my ($self, $req, $res, $ttl) = @_;
     push @trace, 'store';
     
     my $key = $self->cachekey($req);
-    $self->chi->set( $key, [$req->headers,$res], $opts );
+    $self->storage->set( $key, [$req->headers,$res], $ttl );
 }
 
 sub delegate {
-    my ($self, $req, $opts) = @_;
+    my ($self, $req) = @_;
     push @trace, 'delegate';
 
     my $res = $self->pass($req);
