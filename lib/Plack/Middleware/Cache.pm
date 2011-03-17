@@ -3,7 +3,7 @@ use strict;
 use warnings;
 use parent qw/Plack::Middleware/;
 
-use Plack::Util::Accessor qw( storage rules scrub );
+use Plack::Util::Accessor qw( storage ttl scrub allow_reload );
 use Data::Dumper;
 use Plack::Request;
 use Plack::Response;
@@ -18,6 +18,9 @@ sub _uinterval {
     ($t1->[0] - $t0->[0]) * 1_000_000 + $t1->[1] - $t0->[1];
 }
 
+## call: the call hook for the Plack stack.
+## Take one parameter (the env) and return a reponse tuple.
+##
 sub call {
     my ($self,$env) = @_;
 
@@ -56,6 +59,10 @@ sub call {
     $res->finalize;
 }
 
+## handle: take request and decide if we should pass it thru,
+## try to lookup from cache, or invalidate and pass thru.
+## Return the response tuple that should be sent back to the client.
+##
 sub handle {
     my ($self,$req) = @_;
 
@@ -63,6 +70,9 @@ sub handle {
         if ( $req->headers->header('Expect') ) {
             push @trace, 'expect';
             $self->pass($req);
+        } elsif ( $req->cache_control->{'no-cache'} && $self->allow_reload ) {
+            push @trace, 'reload';
+            $self->fetch($req);
         } else {
             $self->lookup($req);
         }
@@ -71,30 +81,44 @@ sub handle {
     }
 }
 
+## pass: delegate request to the backend and return
+## the response. A separate timer is recorded for logging
+## purposes.
+##
 sub pass {
     my ($self,$req) = @_;
     push @trace, 'pass';
+    
     $timer_pass = [gettimeofday];
-
     my $res = $self->app->($req->env);
-
     $timer_pass = _uinterval($timer_pass);
+    
     return $res;
 }
 
+## invalidate: remove any matching entries from cache
+## storage and pass thru the request.
+##
 sub invalidate {
     my ($self,$req) = @_;
     push @trace, 'invalidate';
+    
     $self->storage->remove( $self->cachekey($req) );
     $self->pass($req);
 }
 
-sub match {
+## ttl: determine the configured ttl (or acceptable range of ttl, TODO) for
+## a given request. If return value is a positive scalar, it's ttl in seconds,
+## negative value means must that the entry referenced by req (that maybe
+## rewritten during match processing in this method) must be invalidated from
+## cache. If return value is an array ref, the ttl should be adjusted to that
+## range [min,max]. Undef in a range means "no limit", or that normal rules
+## should be applied.
+##
+sub ttl {
     my ($self, $req) = @_;
 
-    my $path;
-    my $ttl;
-
+    my $path, $ttl;
     my @rules = @{ $self->rules || [] };
     while ( @rules || return ) {
         my $match = shift @rules;
@@ -107,52 +131,151 @@ sub match {
     return $ttl;
 }
 
+## lookup:  try to serve the response from cache. When a matching cache entry is
+## found and is fresh, use it as the response without forwarding any
+## request to the backend. When a matching cache entry is found but is
+## stale, attempt to validate the entry with the backend using conditional
+## GET. When no matching cache entry is found, trigger miss processing.
+##
 sub lookup {
     my ($self, $req) = @_;
     push @trace, 'lookup';
 
-    my $ttl = $self->match($req);
+    ## Determine the default ttl (if defined in configuration)
+    ## TODO: apply it to the cached response
+    my $ttl = $self->ttl($req);
+    return $self->invalidate($req) if ( $ttl < 0 );
 
-    return $self->pass($req)
-        if not defined $ttl;
-
-    return $self->invalidate($req)
-        if ( $req->param and not $self->cachequeries );
-
-    my $entry = $self->fetch( $req );
-    my $res = [ 500, ['Content-Type','text/plain'], ['ISE'] ];
-
+    ## Get response from the cache storage
+    my $entry = $self->get( $req );
     if ( defined $entry ) {
         push @trace, 'hit';
-        $res = $entry->[1];
-        return $self->invalidate($req)
-            if not $self->valid($req,$res);
+        $self->refurbish($req,$entry,$ttl) ||
+        $self->validate($req,$entry,$ttl);
     } else {
         push @trace, 'miss';
-        $res = $self->delegate($req);
-        $self->store($req,$res,$ttl)
-            if $self->valid($req,$res);
+        $self->fetch($req,$ttl);
     }
-    return $res;
 }
 
-sub valid {
-    my ($self, $req, $res) = @_;
+## refurbish: Given a storage entry, return the response
+## with updated Age header.
+##
+sub refurbish {
+    my ($self, $req, $entry, $ttl) = @_;
+    my ($ereq,$eres) = @{$entry};
+    push @trace, 'refurbish';
 
-    my $res_status = $res->[0];
+    return unless $self->is_fresh_enough($entry);
 
-    return
-        unless (
-            $res_status == 200 or
-            $res_status == 203 or
-            $res_status == 300 or
-            $res_status == 301 or
-            $res_status == 302 or
-            $res_status == 404 or
-            $res_status == 410
-        );
-    
+    Plack::Util::header_set($eres->[1], 'Age', 0); ## TODO
+    $eres;
+}
+
+sub is_fresh_enough {
+    my ($self, $entry) = @_;
+    ## TODO
     return 1;
+}
+
+## validate: make a validation request to the backend. If 304 is returned,
+## the stored response can be used (with few headers updated from the
+## validation response). For other responses, enter it to the storage
+## (if cacheable) and return it as is.
+##
+sub validate {
+    my ($self, $req, $entry, $ttl) = @_;
+    my ($ereq,$eres) = @{$entry};
+    push @trace, 'validate';
+
+    ## Make a new validation request based on the original req
+    my $subreq = Plack::Request->new( $req );
+    $subreq->method('GET');
+    $subreq->headers->header('If-Modified-Since') = $eres->last_modified;
+
+    ## ETags that client has, and etags we have..
+    my %req_etag = map { $_ => 1 } split /\s*,\s*/,
+        $subreq->headers->header('If-None-Match');
+    my %store_etag = map { $_ => 1 } split /\s*,\s*/,
+        Plack::Util::header_get($eres->[1], 'ETag');
+
+    ## Any of these etags satisfy our validation request
+    $subreq->headers->header( 'If-None-Match' =>
+        join ', ', (keys %req_etag, keys %store_etag)
+    );
+
+    my $res = $self->pass( $subreq );
+    
+    if ( $res->[0] == 304 ) {
+        push @trace, 'notmodified';
+        
+        ## Extract the ETags that this response validated
+        my %res_etag = map { $_ => 1 } split /\s*,\s*/,
+            Plack::Util::header_get($res->[1], 'ETag');
+
+        ## Return the 304 as is if it validated something we don't have
+        my $etag = Plack::Util::header_get($res->[1], 'ETag');
+        return $res if $etag && $req_etag{$etag} && !$store_etag{$etag};
+
+        ## Copy various caching related headers to the stored response.
+        for ( qw( Date Expires Cache-Control ETag Last-Modified ) ) {
+            my $val = Plack::Util::header_get( $res->[1], $_ );
+            Plack::Util::header_set( $eres->[1], $val );
+        }
+
+        ## And return the stored response
+        return $eres;
+    }
+
+    ## Store the response
+    my $response = Plack::Middleware::Cache::Response->new($res);
+    $self->set($req,$res,$ttl) if $response->is_cacheable;
+
+    $res;
+}
+
+## fetch: The cache missed or a reload is required. Forward the request to the
+## backend and determine whether the response should be stored.
+##
+sub fetch {
+    my ($self, $req, $ttl) = @_;
+    push @trace, 'fetch';
+
+    ## Make a request based on the original req
+    my $subreq = Plack::Request->new( $req );
+    $subreq->method('GET');
+    $subreq->headers->remove_header('If-Modified-Since','If-None-Match');
+  
+    my $res = Plack::Middleware::Cache::Response->new( $self->pass($subreq) );
+
+    ## Mark the response as explicitly private if any of the private
+    ## request headers are present and the response was not explicitly
+    ## declared public.
+    $res->cache_control->{private} = undef
+        if $self->is_private($req) &&
+        exists $res->cache_control->{public};
+
+    # use our own ttl if defined, or use what's provided
+    # cache control can disable the default ttl assigment.
+    $ttl = $res->is_must_revalidate
+        ? $res->ttl
+        : $ttl || $res->ttl;
+
+    ## Store the response
+    my $response = $res->finalize;
+    $self->set($req,$response,$ttl) if $res->is_cacheable;
+
+    $response;
+}
+
+sub is_private {
+    my ($self, $req) = @_;
+        
+    for ( @{ $self->private_headers } ) {
+        return 1 if $req->headers->header($_);
+    }
+
+    return;
 }
 
 sub cachekey {
@@ -166,27 +289,28 @@ sub cachekey {
     $uri->as_string;
 }
 
-sub fetch {
+sub get {
     my ($self, $req) = @_;
-    push @trace, 'fetch';
-    
+    push @trace, 'get';
+
     my $key = $self->cachekey($req);
     $self->storage->get( $key );
 }
 
-sub store {
+sub set {
     my ($self, $req, $res, $ttl) = @_;
-    push @trace, 'store';
-    
+    push @trace, 'set';
+ 
+    ## Read in filehandle bodies and scrub the headers before storage
     my $key = $self->cachekey($req);
-    $self->storage->set( $key, [$req->headers,$res], $ttl );
+    my $response = $self->slurp($res);
+
+    $self->storage->set( $key, [$req->headers,$response], $ttl );
 }
 
-sub delegate {
-    my ($self, $req) = @_;
-    push @trace, 'delegate';
+sub slurp {
+    my ($self, $res) = @_;
 
-    my $res = $self->pass($req);
     foreach ( @{ $self->scrub || [] } ) {
         Plack::Util::header_remove( $res->[1], $_ );
     }
