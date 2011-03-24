@@ -1,0 +1,47 @@
+NAME
+
+    Plack::Middleware::Cache - Caching Reverse Proxy for Plack
+
+SYNOPSIS
+
+    # Note! This modules is work in progress, and the
+    # namespace overlaps heavily with the module released
+    # to CPAN by Ingy döt Net, so there are no immediate plans
+    # to release this module as such.
+
+    my $chi = CHI->new(
+        driver => 'File',
+        root_dir => 'common/cache',
+    );
+
+    enable 'Cache', chi => $chi, rules => [
+        qr{^/api/}          => undef,
+        qr{\.(jpg|png)$}    => { expires_in => '5 min' },
+    ], scrub => [ 'Set-Cookie' ], cachequeries => 1;
+
+DESCRIPTION
+
+    Enable HTTP caching for Plack-based applications.
+
+    Mathing URI's (rules) are cached with the specified
+    expiry time / ttl value to the CHI cache.
+
+    Current implementation (on master branch) does not
+    support cache validation. See devel branch for work in
+    progress towards this.
+
+AUTHOR
+
+    Panu Ervamaa <pnu@cpan.org>
+
+    This module is largely based on Rack::Cache by Ryan Tomayko.
+    See http://rtomayko.github.com/rack-cache/ for more information.
+
+LICENCE
+
+    Copyright (c) 2011. Panu Ervamaa.
+
+    This program is free software; you can redistribute it and/or
+    modify it under the same terms as Perl itself.
+
+    See http://www.perl.com/perl/misc/Artistic.html
