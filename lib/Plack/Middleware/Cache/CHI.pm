@@ -204,6 +204,7 @@ sub delegate {
 1;
 
 =for test_synopsis use Plack::Builder;
+
 =head1 SYNOPSIS
 
     my $chi = CHI->new(

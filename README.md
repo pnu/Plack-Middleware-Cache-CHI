@@ -4,7 +4,19 @@ Plack::Middleware::Cache::CHI - Caching Reverse Proxy for Plack
 
 # VERSION
 
-version 0.101
+version 0.102
+
+# SYNOPSIS
+
+    my $chi = CHI->new(
+        driver => 'File',
+        root_dir => 'common/cache',
+    );
+
+    enable 'Cache::CHI', chi => $chi, rules => [
+        qr{^/api/}          => undef,
+        qr{\.(jpg|png)$}    => { expires_in => '5 min' },
+    ], scrub => [ 'Set-Cookie' ], cachequeries => 1;
 
 # DESCRIPTION
 
@@ -16,16 +28,6 @@ expiry time / ttl value to the CHI cache.
 Current implementation (on master branch) does not
 support cache validation. See devel branch for work in
 progress towards this.
-
-    my $chi = CHI->new(
-        driver => 'File',
-        root_dir => 'common/cache',
-    );
-
-    enable 'Cache::CHI', chi => $chi, rules => [
-        qr{^/api/}          => undef,
-        qr{\.(jpg|png)$}    => { expires_in => '5 min' },
-    ], scrub => [ 'Set-Cookie' ], cachequeries => 1;
 
 # SEE ALSO
 
