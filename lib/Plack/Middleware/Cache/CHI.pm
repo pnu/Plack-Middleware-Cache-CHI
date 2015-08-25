@@ -1,5 +1,7 @@
-package Plack::Middleware::Cache;
 use strict;
+package Plack::Middleware::Cache::CHI;
+# ABSTRACT: Caching Reverse Proxy for Plack
+
 use warnings;
 use parent qw/Plack::Middleware/;
 
@@ -8,6 +10,8 @@ use Data::Dumper;
 use Plack::Request;
 use Plack::Response;
 use Time::HiRes qw( gettimeofday );
+
+# VERSION
 
 our @trace;
 our $timer_call;
@@ -110,7 +114,7 @@ sub lookup {
     push @trace, 'lookup';
 
     my $opts = $self->match($req);
-    
+
     return $self->pass($req)
         if not defined $opts;
 
@@ -149,7 +153,7 @@ sub valid {
             $res_status == 404 or
             $res_status == 410
         );
-    
+
     return 1;
 }
 
@@ -167,7 +171,7 @@ sub cachekey {
 sub fetch {
     my ($self, $req) = @_;
     push @trace, 'fetch';
-    
+
     my $key = $self->cachekey($req);
     $self->chi->get( $key );
 }
@@ -175,7 +179,7 @@ sub fetch {
 sub store {
     my ($self, $req, $res, $opts) = @_;
     push @trace, 'store';
-    
+
     my $key = $self->cachekey($req);
     $self->chi->set( $key, [$req->headers,$res], $opts );
 }
@@ -198,3 +202,37 @@ sub delegate {
 }
 
 1;
+
+=for test_synopsis use Plack::Builder;
+=head1 SYNOPSIS
+
+    my $chi = CHI->new(
+        driver => 'File',
+        root_dir => 'common/cache',
+    );
+
+    enable 'Cache::CHI', chi => $chi, rules => [
+        qr{^/api/}          => undef,
+        qr{\.(jpg|png)$}    => { expires_in => '5 min' },
+    ], scrub => [ 'Set-Cookie' ], cachequeries => 1;
+
+=head1 DESCRIPTION
+
+Enable HTTP caching for Plack-based applications.
+
+Mathing URI's (rules) are cached with the specified
+expiry time / ttl value to the CHI cache.
+
+Current implementation (on master branch) does not
+support cache validation. See devel branch for work in
+progress towards this.
+
+=head1 SEE ALSO
+
+This module is largely based on Rack::Cache by Ryan Tomayko.
+See http://rtomayko.github.com/rack-cache/ for more information.
+
+This module was earlier called Plack::Middleware::Cache and available
+only thru github because of name conflict with another similar CPAN module.
+
+=cut

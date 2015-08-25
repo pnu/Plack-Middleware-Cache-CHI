@@ -1,2 +1,5 @@
-*~
 .*
+!.gitignore
+*~
+*.swp
+/Plack-Middleware-Cache-CHI-*

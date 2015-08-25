@@ -1,0 +1,5 @@
+Changelog for Plack::Middleware::Cache::CHI
+
+{{$NEXT}}
+  * Rename Plack::Middleware::Cache -> Plack::Middleware::Cache::CHI
+  * Initial CPAN release
